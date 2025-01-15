@@ -1,4 +1,5 @@
 """Purge repack helper."""
+
 from __future__ import annotations
 
 import logging
@@ -7,7 +8,7 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 
 from .const import SupportedDialect
-from .models import ALL_TABLES
+from .db_schema import ALL_TABLES
 
 if TYPE_CHECKING:
     from . import Recorder

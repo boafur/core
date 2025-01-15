@@ -1,4 +1,5 @@
 """The ws66i integration models."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -6,8 +7,6 @@ from dataclasses import dataclass
 from pyws66i import WS66i
 
 from .coordinator import Ws66iDataUpdateCoordinator
-
-# A dataclass is basically a struct in C/C++
 
 
 @dataclass
