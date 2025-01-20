@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
 import datetime
 import logging
-import time
 from typing import Any, cast
 
 import aiohttp
@@ -19,18 +17,16 @@ from oauth2client.client import (
 )
 
 from homeassistant.components.application_credentials import AuthImplementation
-from homeassistant.core import CALLBACK_TYPE, HomeAssistant
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import config_entry_oauth2_flow
-from homeassistant.helpers.event import async_track_time_interval
-from homeassistant.util import dt
-
-from .const import (
-    CONF_CALENDAR_ACCESS,
-    DATA_CONFIG,
-    DEFAULT_FEATURE_ACCESS,
-    DOMAIN,
-    FeatureAccess,
+from homeassistant.helpers.event import (
+    async_track_point_in_utc_time,
+    async_track_time_interval,
 )
+from homeassistant.util import dt as dt_util
+
+from .const import CONF_CALENDAR_ACCESS, DEFAULT_FEATURE_ACCESS, FeatureAccess
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,18 +39,29 @@ class OAuthError(Exception):
     """OAuth related error."""
 
 
-class DeviceAuth(AuthImplementation):
-    """OAuth implementation for Device Auth."""
+class InvalidCredential(OAuthError):
+    """Error with an invalid credential that does not support device auth."""
+
+
+class GoogleHybridAuth(AuthImplementation):
+    """OAuth implementation that supports both Web Auth (base class) and Device Auth."""
 
     async def async_resolve_external_data(self, external_data: Any) -> dict:
         """Resolve a Google API Credentials object to Home Assistant token."""
+        if DEVICE_AUTH_CREDS not in external_data:
+            # Assume the Web Auth flow was used, so use the default behavior
+            return await super().async_resolve_external_data(external_data)
         creds: Credentials = external_data[DEVICE_AUTH_CREDS]
+        delta = creds.token_expiry.replace(tzinfo=datetime.UTC) - dt_util.utcnow()
+        _LOGGER.debug(
+            "Token expires at %s (in %s)", creds.token_expiry, delta.total_seconds()
+        )
         return {
             "access_token": creds.access_token,
             "refresh_token": creds.refresh_token,
             "scope": " ".join(creds.scopes),
             "token_type": "Bearer",
-            "expires_in": creds.token_expiry.timestamp() - time.time(),
+            "expires_in": delta.total_seconds(),
         }
 
 
@@ -72,6 +79,9 @@ class DeviceFlow:
         self._oauth_flow = oauth_flow
         self._device_flow_info: DeviceFlowInfo = device_flow_info
         self._exchange_task_unsub: CALLBACK_TYPE | None = None
+        self._timeout_unsub: CALLBACK_TYPE | None = None
+        self._listener: CALLBACK_TYPE | None = None
+        self._creds: Credentials | None = None
 
     @property
     def verification_url(self) -> str:
@@ -83,62 +93,73 @@ class DeviceFlow:
         """Return the code that the user should enter at the verification url."""
         return self._device_flow_info.user_code  # type: ignore[no-any-return]
 
-    async def start_exchange_task(
-        self, finished_cb: Callable[[Credentials | None], Awaitable[None]]
+    @callback
+    def async_set_listener(
+        self,
+        update_callback: CALLBACK_TYPE,
     ) -> None:
-        """Start the device auth exchange flow polling.
+        """Invoke the update callback when the exchange finishes or on timeout."""
+        self._listener = update_callback
 
-        The callback is invoked with the valid credentials or with None on timeout.
-        """
+    @property
+    def creds(self) -> Credentials | None:
+        """Return result of exchange step or None on timeout."""
+        return self._creds
+
+    def async_start_exchange(self) -> None:
+        """Start the device auth exchange flow polling."""
         _LOGGER.debug("Starting exchange flow")
-        assert not self._exchange_task_unsub
-        max_timeout = dt.utcnow() + datetime.timedelta(seconds=EXCHANGE_TIMEOUT_SECONDS)
+        max_timeout = dt_util.utcnow() + datetime.timedelta(
+            seconds=EXCHANGE_TIMEOUT_SECONDS
+        )
         # For some reason, oauth.step1_get_device_and_user_codes() returns a datetime
         # object without tzinfo. For the comparison below to work, it needs one.
         user_code_expiry = self._device_flow_info.user_code_expiry.replace(
-            tzinfo=datetime.timezone.utc
+            tzinfo=datetime.UTC
         )
         expiration_time = min(user_code_expiry, max_timeout)
 
-        def _exchange() -> Credentials:
-            return self._oauth_flow.step2_exchange(
-                device_flow_info=self._device_flow_info
-            )
-
-        async def _poll_attempt(now: datetime.datetime) -> None:
-            assert self._exchange_task_unsub
-            _LOGGER.debug("Attempting OAuth code exchange")
-            # Note: The callback is invoked with None when the device code has expired
-            creds: Credentials | None = None
-            if now < expiration_time:
-                try:
-                    creds = await self._hass.async_add_executor_job(_exchange)
-                except FlowExchangeError:
-                    _LOGGER.debug("Token not yet ready; trying again later")
-                    return
-            self._exchange_task_unsub()
-            self._exchange_task_unsub = None
-            await finished_cb(creds)
-
         self._exchange_task_unsub = async_track_time_interval(
             self._hass,
-            _poll_attempt,
+            self._async_poll_attempt,
             datetime.timedelta(seconds=self._device_flow_info.interval),
         )
+        self._timeout_unsub = async_track_point_in_utc_time(
+            self._hass, self._async_timeout, expiration_time
+        )
+
+    async def _async_poll_attempt(self, now: datetime.datetime) -> None:
+        _LOGGER.debug("Attempting OAuth code exchange")
+        try:
+            self._creds = await self._hass.async_add_executor_job(self._exchange)
+        except FlowExchangeError:
+            _LOGGER.debug("Token not yet ready; trying again later")
+            return
+        self._finish()
+
+    def _exchange(self) -> Credentials:
+        return self._oauth_flow.step2_exchange(device_flow_info=self._device_flow_info)
+
+    @callback
+    def _async_timeout(self, now: datetime.datetime) -> None:
+        _LOGGER.debug("OAuth token exchange timeout")
+        self._finish()
+
+    @callback
+    def _finish(self) -> None:
+        if self._exchange_task_unsub:
+            self._exchange_task_unsub()
+        if self._timeout_unsub:
+            self._timeout_unsub()
+        if self._listener:
+            self._listener()
 
 
-def get_feature_access(hass: HomeAssistant) -> FeatureAccess:
+def get_feature_access(config_entry: ConfigEntry) -> FeatureAccess:
     """Return the desired calendar feature access."""
-    # This may be called during config entry setup without integration setup running when there
-    # is no google entry in configuration.yaml
-    return cast(
-        FeatureAccess,
-        (
-            hass.data.get(DOMAIN, {})
-            .get(DATA_CONFIG, {})
-            .get(CONF_CALENDAR_ACCESS, DEFAULT_FEATURE_ACCESS)
-        ),
-    )
+    if config_entry.options and CONF_CALENDAR_ACCESS in config_entry.options:
+        return FeatureAccess[config_entry.options[CONF_CALENDAR_ACCESS]]
+    return DEFAULT_FEATURE_ACCESS
 
 
 async def async_create_device_flow(
@@ -156,11 +177,15 @@ async def async_create_device_flow(
             oauth_flow.step1_get_device_and_user_codes
         )
     except OAuth2DeviceCodeError as err:
+        _LOGGER.debug("OAuth2DeviceCodeError error: %s", err)
+        # Web auth credentials reply with invalid_client when hitting this endpoint
+        if "Error: invalid_client" in str(err):
+            raise InvalidCredential(str(err)) from err
         raise OAuthError(str(err)) from err
     return DeviceFlow(hass, oauth_flow, device_flow_info)
 
 
-class ApiAuthImpl(AbstractAuth):  # type: ignore[misc]
+class ApiAuthImpl(AbstractAuth):
     """Authentication implementation for google calendar api library."""
 
     def __init__(
@@ -178,7 +203,7 @@ class ApiAuthImpl(AbstractAuth):  # type: ignore[misc]
         return cast(str, self._session.token["access_token"])
 
 
-class AccessTokenAuthImpl(AbstractAuth):  # type: ignore[misc]
+class AccessTokenAuthImpl(AbstractAuth):
     """Authentication implementation used during config flow, without refresh.
 
     This exists to allow the config flow to use the API before it has fully

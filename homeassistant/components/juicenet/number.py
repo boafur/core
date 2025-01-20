@@ -1,12 +1,16 @@
 """Support for controlling juicenet/juicepoint/juicebox based EVSE numbers."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from pyjuicenet import Api, Charger
 
-from homeassistant.components.number import NumberEntity, NumberEntityDescription
-from homeassistant.components.number.const import DEFAULT_MAX_VALUE
+from homeassistant.components.number import (
+    DEFAULT_MAX_VALUE,
+    NumberEntity,
+    NumberEntityDescription,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -16,29 +20,21 @@ from .const import DOMAIN, JUICENET_API, JUICENET_COORDINATOR
 from .entity import JuiceNetDevice
 
 
-@dataclass
-class JuiceNetNumberEntityDescriptionMixin:
-    """Mixin for required keys."""
-
-    setter_key: str
-
-
-@dataclass
-class JuiceNetNumberEntityDescription(
-    NumberEntityDescription, JuiceNetNumberEntityDescriptionMixin
-):
+@dataclass(frozen=True, kw_only=True)
+class JuiceNetNumberEntityDescription(NumberEntityDescription):
     """An entity description for a JuiceNetNumber."""
 
-    max_value_key: str | None = None
+    setter_key: str
+    native_max_value_key: str | None = None
 
 
 NUMBER_TYPES: tuple[JuiceNetNumberEntityDescription, ...] = (
     JuiceNetNumberEntityDescription(
-        name="Amperage Limit",
+        translation_key="amperage_limit",
         key="current_charging_amperage_limit",
-        min_value=6,
-        max_value_key="max_charging_amperage",
-        step=1,
+        native_min_value=6,
+        native_max_value_key="max_charging_amperage",
+        native_step=1,
         setter_key="set_charging_amperage_limit",
     ),
 )
@@ -77,22 +73,20 @@ class JuiceNetNumber(JuiceNetDevice, NumberEntity):
         super().__init__(device, description.key, coordinator)
         self.entity_description = description
 
-        self._attr_name = f"{self.device.name} {description.name}"
-
     @property
-    def value(self) -> float | None:
+    def native_value(self) -> float | None:
         """Return the value of the entity."""
         return getattr(self.device, self.entity_description.key, None)
 
     @property
-    def max_value(self) -> float:
+    def native_max_value(self) -> float:
         """Return the maximum value."""
-        if self.entity_description.max_value_key is not None:
-            return getattr(self.device, self.entity_description.max_value_key)
-        if self.entity_description.max_value is not None:
-            return self.entity_description.max_value
+        if self.entity_description.native_max_value_key is not None:
+            return getattr(self.device, self.entity_description.native_max_value_key)
+        if self.entity_description.native_max_value is not None:
+            return self.entity_description.native_max_value
         return DEFAULT_MAX_VALUE
 
-    async def async_set_value(self, value: float) -> None:
+    async def async_set_native_value(self, value: float) -> None:
         """Update the current value."""
         await getattr(self.device, self.entity_description.setter_key)(value)
